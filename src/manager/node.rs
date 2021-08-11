@@ -24,6 +24,8 @@ use arcon_macros::ArconState;
 use arcon_state::Backend;
 use fxhash::FxHashMap;
 use kompact::{component::AbstractComponent, prelude::*};
+
+#[cfg(feature = "metrics")]
 use std::time::Instant;
 use std::{collections::HashSet, sync::Arc};
 
@@ -264,6 +266,7 @@ where
     }
 
     fn handle_node_event(&mut self, event: NodeManagerEvent) -> ArconResult<()> {
+        #[cfg(feature = "metrics")]
         gauge!("nodes", self.nodes.len() as f64 ,"node_manager" => self.state_id.clone());
 
         match event {
