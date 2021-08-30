@@ -5,22 +5,27 @@ use crate::{
     application::conf::logger::ArconLogger,
     data::{ArconMessage, Epoch, NodeID, StateID, Watermark},
     error::*,
-    index::{
-        ArconState, HashTable, IndexOps, LocalValue, StateConstructor, ValueIndex, EMPTY_STATE_ID,
-    },
+    index::{HashTable, IndexOps, LocalValue, ValueIndex, EMPTY_STATE_ID},
     manager::{
         epoch::EpochEvent,
-        query::{QueryManagerMsg, QueryManagerPort, TableRegistration},
         snapshot::{Snapshot, SnapshotEvent, SnapshotManagerPort},
     },
+    prelude::OperatorBuilder,
     reportable_error,
     stream::operator::Operator,
 };
+
+#[cfg(feature = "metrics")]
+use metrics::{gauge, histogram, register_gauge, register_histogram};
+
 use arcon_macros::ArconState;
 use arcon_state::Backend;
 use fxhash::FxHashMap;
 use kompact::{component::AbstractComponent, prelude::*};
-use std::{collections::HashSet, sync::Arc};
+
+#[cfg(feature = "metrics")]
+use std::time::Instant;
+use std::{collections::HashSet, fs, sync::Arc};
 
 pub type AbstractNode<IN> = (
     Arc<dyn AbstractComponent<Message = ArconMessage<IN>>>,
@@ -88,9 +93,8 @@ pub struct NodeManagerState<B: Backend> {
     checkpoint_acks: HashSet<(NodeID, Epoch)>,
 }
 
-impl<B: Backend> StateConstructor for NodeManagerState<B> {
-    type BackendType = B;
-    fn new(backend: Arc<Self::BackendType>) -> Self {
+impl<B: Backend> NodeManagerState<B> {
+    fn new(backend: Arc<B>) -> Self {
         Self {
             watermarks: HashTable::with_capacity("_watermarks", backend.clone(), 64, 64),
             epochs: HashTable::with_capacity("_epochs", backend.clone(), 64, 64),
@@ -127,13 +131,11 @@ where
     /// A text description of the operating NodeManager
     ///
     /// e.g., window_sliding_avg_price
-    state_id: StateID,
+    pub(crate) state_id: StateID,
     /// Port for incoming local events from nodes this manager controls
     pub(crate) manager_port: ProvidedPort<NodeManagerPort>,
     /// Port for the SnapshotManager component
     pub(crate) snapshot_manager_port: RequiredPort<SnapshotManagerPort>,
-    /// Port for the QueryManager component
-    pub(crate) query_manager_port: RequiredPort<QueryManagerPort>,
     /// Actor Reference to the EpochManager
     epoch_manager: ActorRefStrong<EpochEvent>,
     /// Reference to KompactSystem that the Nodes run on..
@@ -153,6 +155,7 @@ where
     /// Internal manager state
     manager_state: NodeManagerState<B>,
     latest_snapshot: Option<Snapshot>,
+    builder: OperatorBuilder<OP, B>,
     logger: ArconLogger,
 }
 
@@ -168,13 +171,19 @@ where
         in_channels: Vec<NodeID>,
         backend: Arc<B>,
         logger: ArconLogger,
+        builder: OperatorBuilder<OP, B>,
     ) -> Self {
+        #[cfg(feature = "metrics")]
+        {
+            register_gauge!("nodes", "node_manager" => state_id.clone());
+            register_histogram!("checkpoint_execution_time_ms", "node_manager" => state_id.clone());
+            register_gauge!("last_checkpoint_size", "node_manager"=> state_id.clone());
+        }
         NodeManager {
             ctx: ComponentContext::uninitialised(),
             state_id,
             manager_port: ProvidedPort::uninitialised(),
             snapshot_manager_port: RequiredPort::uninitialised(),
-            query_manager_port: RequiredPort::uninitialised(),
             epoch_manager,
             data_system,
             node_parallelism: num_cpus::get(),
@@ -186,6 +195,7 @@ where
             backend,
             latest_snapshot: None,
             logger,
+            builder,
         }
     }
 
@@ -218,6 +228,12 @@ where
                     self.state_id.clone(),
                     snapshot.clone(),
                 ));
+
+                #[cfg(feature = "metrics")]
+                {
+                    let metadata = fs::metadata(checkpoint_dir.clone())?;
+                    gauge!("last_checkpoint_size", metadata.len() as f64,"node_manager" => self.state_id.clone());
+                }
 
                 self.latest_snapshot = Some(snapshot);
             }
@@ -273,7 +289,15 @@ where
                             .insert((request.id, request.epoch));
 
                         if self.manager_state.checkpoint_acks.len() == self.nodes.len() {
+                            #[cfg(feature = "metrics")]
+                            let start_time = Instant::now();
+
                             self.checkpoint()?;
+                            #[cfg(feature = "metrics")]
+                            {
+                                let elapsed = start_time.elapsed();
+                                histogram!("checkpoint_execution_time_ms", elapsed.as_millis() as f64,"node_manager" => self.state_id.clone());
+                            }
                             self.manager_state.checkpoint_acks.clear();
 
                             for (_, port_ref) in self.nodes.values() {
@@ -281,21 +305,6 @@ where
                                     NodeEvent::CheckpointResponse(CheckpointResponse::NoAction),
                                     port_ref,
                                 );
-                            }
-
-                            if OP::OperatorState::has_tables() {
-                                if let Some(snapshot) = &self.latest_snapshot {
-                                    let mut state = OP::OperatorState::restore(snapshot.clone())?;
-                                    for table in state.tables() {
-                                        let registration = TableRegistration {
-                                            epoch: epoch.epoch,
-                                            table,
-                                        };
-                                        self.query_manager_port.trigger(
-                                            QueryManagerMsg::TableRegistration(registration),
-                                        );
-                                    }
-                                }
                             }
                         }
                     }
@@ -314,6 +323,8 @@ where
     fn on_start(&mut self) -> Handled {
         info!(self.logger, "Started NodeManager for {}", self.state_id,);
 
+        #[cfg(feature = "metrics")]
+        gauge!("nodes", self.nodes.len() as f64 ,"node_manager" => self.state_id.clone());
         // Register state id
         if self.has_snapshot_state() {
             self.snapshot_manager_port
@@ -343,16 +354,6 @@ where
 {
     fn handle(&mut self, _: SnapshotEvent) -> Handled {
         Handled::Ok
-    }
-}
-
-impl<OP, B> Require<QueryManagerPort> for NodeManager<OP, B>
-where
-    OP: Operator + 'static,
-    B: Backend,
-{
-    fn handle(&mut self, _: Never) -> Handled {
-        unreachable!("can't be instantiated!");
     }
 }
 

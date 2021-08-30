@@ -140,6 +140,7 @@ name = "arcon_allocator"
 version = "0.1.0"
 dependencies = [
  "fxhash",
+ "metrics",
  "snafu",
 ]
 
@@ -160,22 +161,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "arcon_shell"
-version = "0.1.0"
-dependencies = [
- "arcon",
- "clap",
- "prettytable-rs",
- "rustyline",
-]
-
-[[package]]
 name = "arcon_state"
 version = "0.1.1"
 dependencies = [
  "bytes 1.0.1",
  "cc",
  "cfg-if 0.1.10",
+ "metrics",
  "once_cell",
  "prost 0.7.0",
  "rocksdb",
